@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "neovox-inbound-parser",
+  "main": "src/index.js",
+  "compatibility_date": "2026-02-26",
+  "observability": {
+    "enabled": true
+  },
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "WORKER_URL": "https://neovox-inbound-parser.direccion-e2d.workers.dev"
+  }
+}
