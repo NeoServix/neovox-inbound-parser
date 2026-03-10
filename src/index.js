@@ -1,5 +1,22 @@
 import PostalMime from 'postal-mime';
 
+// Función auxiliar para extraer día y hora en la zona de operaciones
+function getMadridDateTime() {
+  const now = new Date();
+  const madridDate = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
+  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  
+  const dayName = days[madridDate.getDay()];
+  const hour = madridDate.getHours().toString().padStart(2, '0');
+  const minute = madridDate.getMinutes().toString().padStart(2, '0');
+  
+  return { 
+    dayName, 
+    timeStr: `${hour}:${minute}`, 
+    hourNum: madridDate.getHours() 
+  };
+}
+
 export default {
   // 1. MANEJADOR HTTP: Gestión de voz y estado de llamadas
   async fetch(request, env, ctx) {
@@ -57,7 +74,6 @@ export default {
           })
         });
 
-        // Alerta en tiempo real si el comercial no coge el teléfono
         if (callStatus === 'no-answer' || callStatus === 'failed') {
           const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=contact_email,name`, { headers: headersDb });
           const orgData = await orgRes.json();
@@ -106,24 +122,31 @@ export default {
           'Content-Type': 'application/json'
       };
 
-      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${message.to}&select=id,business_hours,assigned_phone,ai_prompt_template,contact_email`, { headers: headersDb });
+      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${message.to}&select=id,schedule,assigned_phone,ai_prompt_template,contact_email`, { headers: headersDb });
       const orgData = await orgRes.json();
 
       if (!orgData || orgData.length === 0) return;
 
       const orgId = orgData[0].id;
       orgIdToLog = orgId; 
-      const bizHours = orgData[0].business_hours || { open: "09:00", close: "21:00" };
+      
       const telefonoAgencia = orgData[0].assigned_phone;
       const customPrompt = orgData[0].ai_prompt_template || "Resume este lead en 15 palabras. Indica nombre y motivo de contacto. Sin saludos ni instrucciones.";
 
       if (!telefonoAgencia) throw new Error("Agencia sin número de teléfono asignado.");
 
-      const madridHourStr = new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid", hour: '2-digit', hour12: false });
-      const currentHour = Number(madridHourStr);
-      const isOutOfHours = (currentHour < Number(bizHours.open.split(':')[0]) || currentHour >= Number(bizHours.close.split(':')[0]));
+      // Corrección en la lectura de las claves del JSON
+      const { dayName, timeStr } = getMadridDateTime();
+      const dbSchedule = orgData[0].schedule || {};
+      const todayConfig = dbSchedule[dayName];
+      
+      let isOutOfHours = true;
+      if (todayConfig && todayConfig.isOpen) {
+        if (timeStr >= todayConfig.open && timeStr < todayConfig.close) {
+          isOutOfHours = false;
+        }
+      }
 
-      // La IA procesa la información siempre; incluso de noche
       let susurro = "Nuevo lead recibido.";
       const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
@@ -161,7 +184,6 @@ export default {
       const insertedLeads = await leadInsert.json();
       const newLeadId = insertedLeads[0]?.id;
 
-      // Cortamos el proceso para que no salgan llamadas ni correos individuales de madrugada
       if (isOutOfHours) return;
 
       await fetch(`${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agent.id}`, {
@@ -211,8 +233,7 @@ export default {
 
   // 3. MANEJADOR DE TAREAS: Disparador matutino de resúmenes
   async scheduled(event, env, ctx) {
-    const madridHourStr = new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid", hour: '2-digit', hour12: false });
-    const currentHour = Number(madridHourStr);
+    const { dayName, hourNum } = getMadridDateTime();
 
     const headersDb = {
       'apikey': env.SUPABASE_SERVICE_KEY,
@@ -220,14 +241,19 @@ export default {
       'Content-Type': 'application/json'
     };
 
-    const orgsRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?select=id,name,contact_email,business_hours`, { headers: headersDb });
+    const orgsRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?select=id,name,contact_email,schedule`, { headers: headersDb });
     const orgs = await orgsRes.json();
 
     for (const org of orgs) {
-      const openTime = org.business_hours?.open || "09:00";
-      const openHour = Number(openTime.split(':')[0]);
+      const dbSchedule = org.schedule || {};
+      const todayConfig = dbSchedule[dayName];
 
-      if (openHour === currentHour) {
+      if (!todayConfig || !todayConfig.isOpen) continue;
+
+      // Corrección en la lectura de apertura
+      const openHour = Number(todayConfig.open.split(':')[0]);
+
+      if (openHour === hourNum) {
         const leadsRes = await fetch(`${env.SUPABASE_URL}/rest/v1/leads?org_id=eq.${org.id}&status=eq.pending_notification`, { headers: headersDb });
         const pendingLeads = await leadsRes.json();
 
