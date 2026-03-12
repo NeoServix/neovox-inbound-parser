@@ -232,10 +232,16 @@ export default {
 
       const headersDb = getDbHeaders(env);
 
-      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${message.to}&select=id,business_hours,assigned_phone,ai_prompt_template`, { headers: headersDb });
+      // Convertimos el receptor a minúsculas para forzar coincidencia con la BBDD
+      const targetEmail = (message.to || "").toLowerCase();
+      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${targetEmail}&select=id,business_hours,assigned_phone,ai_prompt_template`, { headers: headersDb });
       const orgData = await orgRes.json();
 
-      if (!orgData || orgData.length === 0) return;
+      // Blindaje contra errores de Supabase
+      if (!Array.isArray(orgData) || orgData.length === 0) {
+          console.log("Rechazado: Agencia no encontrada o error DB para el correo", targetEmail, "Respuesta:", orgData);
+          return;
+      }
 
       const orgId = orgData[0].id;
 
@@ -252,6 +258,13 @@ export default {
       });
       
       const insertedLeads = await leadInsert.json();
+
+      // Blindaje de inserción
+      if (!Array.isArray(insertedLeads) || insertedLeads.length === 0) {
+          console.log("Fallo crítico: No se pudo escribir el lead en base de datos. Detalles:", insertedLeads);
+          return;
+      }
+
       const currentLeadId = insertedLeads[0]?.id;
 
       // 2. EXTRACCIÓN Y VALIDACIÓN
@@ -266,6 +279,7 @@ export default {
                   body: JSON.stringify({ status: "manual_review_needed" })
               });
           }
+          console.log(`Lead ${currentLeadId} guardado. No se detectó teléfono en la lectura inicial.`);
           return; 
       }
 
@@ -341,7 +355,7 @@ export default {
       }
 
     } catch (error) {
-      console.log("Fallo crítico:", error.message);
+      console.log("Fallo crítico general:", error.message);
     }
   },
 
