@@ -368,7 +368,13 @@ export default {
       if (isOutOfHours) finalStatus = "pending_notification";
       else if (!agent) finalStatus = "unanswered";
 
+      // Lógica de corrección de canal
+      const canalReal = (datosExtraidos.origen && datosExtraidos.origen !== 'desconocido') 
+          ? 'portal_inmobiliario' 
+          : 'correo_directo';
+
       const updatePayload = { 
+          source_channel: canalReal,
           portal_source: datosExtraidos.origen,
           parsed_data: datosExtraidos,
           ai_whisper: datosExtraidos.susurro_ia,
