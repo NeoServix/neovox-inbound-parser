@@ -40,7 +40,6 @@ async function triggerTwilioCall(env, agent, telefonoCliente, telefonoAgencia, s
 
   const twilioAuth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
   
-  // Si agota los 10 segundos de espera, redirige al motor de relevo
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Gather numDigits="1" action="${env.WORKER_URL}/gather?tel=${encodeURIComponent(telefonoCliente)}&amp;from=${encodeURIComponent(telefonoAgencia)}&amp;agent_id=${agent.id}" method="POST" timeout="10">
@@ -59,7 +58,7 @@ async function triggerTwilioCall(env, agent, telefonoCliente, telefonoAgencia, s
         To: agent.phone_number, 
         From: telefonoAgencia, 
         Twiml: twiml,
-        MachineDetection: 'Enable', // Detección de buzón de voz activada
+        MachineDetection: 'Enable', 
         StatusCallback: statusCallbackUrl,
         StatusCallbackEvent: 'completed',
         StatusCallbackMethod: 'POST'
@@ -98,10 +97,21 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
       const telAgencia = orgData[0].assigned_phone;
       const susurro = leadData[0].ai_whisper || "Nuevo lead reasignado.";
       
+      await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}`, {
+          method: 'PATCH',
+          headers: headersDb,
+          body: JSON.stringify({ assigned_agent_id: nextAgent.id })
+      });
+
       await triggerTwilioCall(env, nextAgent, telCliente, telAgencia, susurro, orgId, leadId);
+
+      await fetch(`${env.SUPABASE_URL}/rest/v1/interactions`, {
+          method: 'POST',
+          headers: { ...headersDb, 'Prefer': 'return=minimal' },
+          body: JSON.stringify({ org_id: orgId, lead_id: leadId, agent_id: nextAgent.id, connection_latency_ms: 0 })
+      });
     }
   } else {
-    // Si no hay más agentes disponibles, avisar a gerencia
     const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=contact_email,name`, { headers: headersDb });
     const orgData = await orgRes.json();
     const contactEmail = orgData[0]?.contact_email;
@@ -111,12 +121,20 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
         method: "POST",
         headers: { "Authorization": `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify({
-          from: "NeoVox Alertas <onboarding@resend.dev>",
+          from: "NeoVox Alertas <alertas@neovox.app>",
           to: contactEmail,
           subject: `Alerta Crítica: Lead sin atender en ${orgData[0]?.name}`,
-          html: `<p>Ningún agente ha respondido a la llamada de conexión tras la cadena de relevo.</p>`
+          html: `<p>Ningún agente ha respondido a la llamada de conexión tras la cadena de relevo. Revisa el panel para contactar al cliente manualmente.</p>`
         })
       });
+    }
+
+    if (leadId) {
+        await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}`, {
+            method: 'PATCH',
+            headers: headersDb,
+            body: JSON.stringify({ status: 'unanswered' })
+        });
     }
   }
 }
@@ -154,7 +172,6 @@ export default {
         return new Response(xmlDial, { headers: { 'Content-Type': 'text/xml' } });
       }
 
-      // Si pulsa cualquier otra tecla, lo redirigimos al relevo
       const xmlRedirect = `<?xml version="1.0" encoding="UTF-8"?>
         <Response>
           <Redirect method="POST">${env.WORKER_URL}/fallback${url.search}</Redirect>
@@ -188,7 +205,6 @@ export default {
       const agentId = url.searchParams.get('agent_id');
       const leadId = url.searchParams.get('lead_id');
 
-      // Detectamos si el teléfono está apagado o salta el contestador automático
       if (callStatus === 'no-answer' || callStatus === 'failed' || callStatus === 'busy' || answeredBy === 'machine_start') {
         ctx.waitUntil(executeFallback(env, orgId, agentId, leadId));
       }
@@ -218,8 +234,6 @@ export default {
   async email(message, env, ctx) {
     try {
       const email = await PostalMime.parse(message.raw, { attachmentEncoding: 'base64' });
-      const leadNombre = email.from?.name || "Usuario Web";
-      const leadEmail = email.from?.address || "Sin Email";
       const contenido = email.text || email.html || "";
 
       const safePayload = {
@@ -232,26 +246,23 @@ export default {
 
       const headersDb = getDbHeaders(env);
 
-      // Convertimos el receptor a minúsculas para forzar coincidencia con la BBDD
       const targetEmail = (message.to || "").toLowerCase();
-      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${targetEmail}&select=id,business_hours,assigned_phone,ai_prompt_template`, { headers: headersDb });
+      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${targetEmail}&select=id,business_hours,assigned_phone,ai_prompt_template,contact_email,name`, { headers: headersDb });
       const orgData = await orgRes.json();
 
-      // Blindaje contra errores de Supabase
       if (!Array.isArray(orgData) || orgData.length === 0) {
-          console.log("Rechazado: Agencia no encontrada o error DB para el correo", targetEmail, "Respuesta:", orgData);
+          console.log("Rechazado: Agencia no encontrada o error DB para el correo", targetEmail);
           return;
       }
 
       const orgId = orgData[0].id;
 
-      // 1. INSERCIÓN DE SEGURIDAD (Carga Bruta)
       const leadInsert = await fetch(`${env.SUPABASE_URL}/rest/v1/leads`, {
           method: 'POST',
           headers: { ...headersDb, 'Prefer': 'return=representation' },
           body: JSON.stringify({
               org_id: orgId,
-              source_channel: "portal_inmobiliario",
+              source_channel: "correo_directo",
               raw_payload: safePayload, 
               status: "processing"
           })
@@ -259,45 +270,81 @@ export default {
       
       const insertedLeads = await leadInsert.json();
 
-      // Blindaje de inserción
-      if (!Array.isArray(insertedLeads) || insertedLeads.length === 0) {
-          console.log("Fallo crítico: No se pudo escribir el lead en base de datos. Detalles:", insertedLeads);
-          return;
+      if (!Array.isArray(insertedLeads) || insertedLeads.length === 0) return;
+      
+      const currentLeadId = insertedLeads[0]?.id;
+      const reglaAgencia = orgData[0].ai_prompt_template || "Resume el contacto entrante indicando el nombre y el inmueble en máximo 15 palabras. Cero saludos y cero despedidas.";
+
+      const extractorPrompt = `Eres un procesador de datos backend. Analiza este correo inmobiliario y extrae la información del inquilino/comprador. Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta. Si un dato no aparece, pon null.
+      {
+        "origen": "idealista o fotocasa o pisos.com o habitaclia o desconocido",
+        "nombre": "nombre del cliente",
+        "telefono": "teléfono con prefijo internacional, ej: +34600000000",
+        "perfil_inquilino": {
+          "inmueble": "referencia o dirección del inmueble",
+          "personas": "número de personas",
+          "mascotas": "información sobre mascotas",
+          "mudanza": "fecha de mudanza deseada",
+          "ingresos": "datos económicos o laborales",
+          "mensaje_original": "texto o carta de presentación del cliente"
+        },
+        "susurro_ia": "AQUÍ DEBES APLICAR ESTA REGLA ESTRICTA DE LA AGENCIA: ${reglaAgencia}"
+      }`;
+
+      const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+              model: "llama-3.1-8b-instant",
+              response_format: { type: "json_object" },
+              messages: [
+                  { role: "system", content: extractorPrompt },
+                  { role: "user", content: `Remitente: ${email.from?.address}. Asunto: ${email.subject}. Contenido: ${contenido.substring(0, 3000)}` }
+              ],
+              temperature: 0
+          })
+      });
+      
+      const groqData = await groqRes.json();
+      const aiResponse = groqData.choices?.[0]?.message?.content;
+      
+      let datosExtraidos;
+      try {
+        datosExtraidos = JSON.parse(aiResponse);
+      } catch (e) {
+        console.log("Error al leer el JSON de la IA:", aiResponse);
+        return;
       }
 
-      const currentLeadId = insertedLeads[0]?.id;
+      if (!datosExtraidos.telefono) {
+          await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
+              method: 'PATCH',
+              headers: headersDb,
+              body: JSON.stringify({ 
+                  portal_source: datosExtraidos.origen,
+                  parsed_data: datosExtraidos,
+                  status: "manual_review_needed" 
+              })
+          });
 
-      // 2. EXTRACCIÓN Y VALIDACIÓN
-      const phoneRegex = /(?:\+34|0034|34)?[\s\-]*(?:6|7)(?:[\s\-]*\d){8}/;
-      const match = contenido.match(phoneRegex);
-      
-      if (!match) {
-          if (currentLeadId) {
-              await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
-                  method: 'PATCH',
-                  headers: headersDb,
-                  body: JSON.stringify({ status: "manual_review_needed" })
-              });
+          const contactEmail = orgData[0]?.contact_email;
+          if (contactEmail && env.RESEND_API_KEY) {
+            await fetch("https://api.resend.com/emails", {
+              method: "POST",
+              headers: { "Authorization": `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                from: "NeoVox Alertas <alertas@neovox.app>",
+                to: contactEmail,
+                subject: `Revisión Manual: Lead sin teléfono en ${orgData[0]?.name}`,
+                html: `<p>Ha entrado un nuevo lead desde <strong>${datosExtraidos.origen || 'un portal'}</strong> para el inmueble <strong>${datosExtraidos.perfil_inquilino?.inmueble || 'desconocido'}</strong>, pero no se ha encontrado un número de teléfono válido en el correo.</p><p>El lead se ha guardado en tu panel para revisión manual.</p>`
+              })
+            });
           }
-          console.log(`Lead ${currentLeadId} guardado. No se detectó teléfono en la lectura inicial.`);
           return; 
       }
 
-      const telefonoCliente = "+34" + match[0].replace(/\D/g, '').slice(-9);
-
-      // 3. ACTUALIZACIÓN CON DATOS LIMPIOS
-      await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
-          method: 'PATCH',
-          headers: headersDb,
-          body: JSON.stringify({ 
-              parsed_data: { nombre: leadNombre, email: leadEmail, telefono: telefonoCliente }
-          })
-      });
-
       const telefonoAgencia = orgData[0].assigned_phone;
-      const customPrompt = orgData[0].ai_prompt_template || "Resume este lead en 15 palabras. Indica nombre y motivo de contacto. Sin saludos ni instrucciones.";
-
-      if (!telefonoAgencia) throw new Error("Agencia sin número de teléfono asignado.");
+      if (!telefonoAgencia) throw new Error("Agencia sin número asignado.");
 
       const { dayName, timeStr } = getMadridDateTime();
       const dbSchedule = orgData[0].business_hours || {};
@@ -310,41 +357,42 @@ export default {
         }
       }
 
-      let susurro = "Nuevo lead recibido.";
-      const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-              model: "llama-3.1-8b-instant",
-              messages: [
-                  { role: "system", content: customPrompt },
-                  { role: "user", content: `Lead de: ${leadNombre}. Texto: ${contenido.substring(0, 400)}` }
-              ],
-              temperature: 0
-          })
-      });
-      const groqData = await groqRes.json();
-      const aiText = groqData.choices?.[0]?.message?.content;
-      if (aiText) susurro = aiText;
+      let agent = null;
+      if (!isOutOfHours) {
+          const agentRes = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?org_id=eq.${orgId}&is_receiving_calls=eq.true&consecutive_misses=lt.3&order=last_assigned_at.asc&limit=1`, { headers: headersDb });
+          const agents = await agentRes.json();
+          agent = agents[0];
+      }
 
-      await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
+      let finalStatus = "connected";
+      if (isOutOfHours) finalStatus = "pending_notification";
+      else if (!agent) finalStatus = "unanswered";
+
+      const updatePayload = { 
+          portal_source: datosExtraidos.origen,
+          parsed_data: datosExtraidos,
+          ai_whisper: datosExtraidos.susurro_ia,
+          status: finalStatus
+      };
+
+      // Aquí cerramos la asignación en una única escritura
+      if (agent) {
+          updatePayload.assigned_agent_id = agent.id;
+      }
+
+      const patchResFull = await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
           method: 'PATCH',
           headers: headersDb,
-          body: JSON.stringify({ 
-              ai_whisper: susurro,
-              status: isOutOfHours ? "pending_notification" : "connected"
-          })
+          body: JSON.stringify(updatePayload)
       });
 
-      if (isOutOfHours) return;
+      if (!patchResFull.ok) {
+          console.log("Error DB actualización completa:", await patchResFull.text());
+      }
 
-      // 4. ASIGNACIÓN INICIAL
-      const agentRes = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?org_id=eq.${orgId}&is_receiving_calls=eq.true&consecutive_misses=lt.3&order=last_assigned_at.asc&limit=1`, { headers: headersDb });
-      const agents = await agentRes.json();
-      const agent = agents[0];
-      if (!agent) return;
+      if (isOutOfHours || !agent) return;
 
-      await triggerTwilioCall(env, agent, telefonoCliente, telefonoAgencia, susurro, orgId, currentLeadId);
+      await triggerTwilioCall(env, agent, datosExtraidos.telefono, telefonoAgencia, datosExtraidos.susurro_ia, orgId, currentLeadId);
 
       if (currentLeadId) {
           await fetch(`${env.SUPABASE_URL}/rest/v1/interactions`, {
@@ -399,7 +447,7 @@ export default {
               method: "POST",
               headers: { "Authorization": `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
               body: JSON.stringify({
-                from: "NeoVox Alertas <onboarding@resend.dev>",
+                from: "NeoVox Alertas <alertas@neovox.app>",
                 to: org.contact_email,
                 subject: `Cierre nocturno: ${pendingLeads.length} nuevos leads para ${org.name}`,
                 html: emailBody
