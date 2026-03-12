@@ -86,16 +86,22 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
   const nextAgents = await agentRes.json();
   const nextAgent = nextAgents[0];
 
-  if (nextAgent && leadId) {
+  // Extraemos los datos del lead antes del if para tenerlos disponibles en la alerta
+  let infoLead = null;
+  if (leadId) {
     const leadRes = await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}&select=parsed_data,ai_whisper`, { headers: headersDb });
     const leadData = await leadRes.json();
+    infoLead = leadData[0];
+  }
+
+  if (nextAgent && infoLead) {
     const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=assigned_phone`, { headers: headersDb });
     const orgData = await orgRes.json();
 
-    if (leadData[0] && orgData[0]) {
-      const telCliente = leadData[0].parsed_data?.telefono;
+    if (orgData[0]) {
+      const telCliente = infoLead.parsed_data?.telefono;
       const telAgencia = orgData[0].assigned_phone;
-      const susurro = leadData[0].ai_whisper || "Nuevo lead reasignado.";
+      const susurro = infoLead.ai_whisper || "Nuevo lead reasignado.";
       
       await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}`, {
           method: 'PATCH',
@@ -117,14 +123,28 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
     const contactEmail = orgData[0]?.contact_email;
 
     if (contactEmail && env.RESEND_API_KEY) {
+      const nombreCli = infoLead?.parsed_data?.nombre || "Desconocido";
+      const telCli = infoLead?.parsed_data?.telefono || "No disponible";
+      const resumen = infoLead?.ai_whisper || "Sin resumen disponible";
+
       await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Authorization": `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify({
           from: "NeoVox Alertas <alertas@neovox.app>",
           to: contactEmail,
-          subject: `Alerta Crítica: Lead sin atender en ${orgData[0]?.name}`,
-          html: `<p>Ningún agente ha respondido a la llamada de conexión tras la cadena de relevo. Revisa el panel para contactar al cliente manualmente.</p>`
+          subject: `URGENTE: Lead sin atender - ${nombreCli}`,
+          html: `
+            <div style="font-family: sans-serif; color: #333;">
+              <h2 style="color: #e63946;">Alerta Crítica de Relevo</h2>
+              <p>Ningún agente ha podido atender la llamada tras recorrer la cadena de disponibilidad.</p>
+              <hr />
+              <p><strong>Cliente:</strong> ${nombreCli}</p>
+              <p><strong>Teléfono:</strong> <a href="tel:${telCli}">${telCli}</a></p>
+              <p><strong>Contexto IA:</strong> ${resumen}</p>
+              <hr />
+              <p style="font-size: 12px; color: #666;">Devuelve la llamada manualmente desde tu terminal para no perder el contacto.</p>
+            </div>`
         })
       });
     }
