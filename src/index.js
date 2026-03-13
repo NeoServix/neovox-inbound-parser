@@ -254,6 +254,14 @@ export default {
   async email(message, env, ctx) {
     try {
       const email = await PostalMime.parse(message.raw, { attachmentEncoding: 'base64' });
+      
+      // NUEVO: Cortafuegos anti-bucles SMTP
+      const remitente = (email.from?.address || "").toLowerCase();
+      if (remitente === "alertas@neovox.app") {
+          console.log("Bloqueo de seguridad: Correo rebotado desde el propio sistema de alertas. Abortando lectura.");
+          return;
+      }
+
       const contenido = email.text || email.html || "";
 
       const safePayload = {
@@ -297,7 +305,7 @@ export default {
 
       const extractorPrompt = `Eres un procesador de datos backend. Analiza este correo inmobiliario y extrae la información del inquilino/comprador. Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta. Si un dato no aparece, pon null.
       {
-        "origen": "idealista o fotocasa o pisos.com o habitaclia o desconocido",
+        "origen": "idealista o fotocasa o pisos.com o tecnocasa o habitaclia o desconocido",
         "nombre": "nombre del cliente",
         "telefono": "teléfono con prefijo internacional, ej: +34600000000",
         "perfil_inquilino": {
