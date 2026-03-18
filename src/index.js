@@ -28,6 +28,62 @@ function getDbHeaders(env) {
   };
 }
 
+// Motor de búsqueda con Doble Salto (Zona -> General)
+async function getNextAvailableAgent(env, orgId, currentAgentId, leadPrefix) {
+  const headersDb = getDbHeaders(env);
+  const excludeFilter = currentAgentId ? `&id=neq.${currentAgentId}` : '';
+  const baseFilter = `org_id=eq.${orgId}&is_receiving_calls=eq.true&consecutive_misses=lt.3${excludeFilter}&order=last_assigned_at.asc&limit=1`;
+
+  // 1. Primer Salto: Intento de enrutamiento por zona
+  if (leadPrefix) {
+    const urlZona = `${env.SUPABASE_URL}/rest/v1/agents?${baseFilter}&assigned_prefixes=ilike.*${leadPrefix}*`;
+    const resZona = await fetch(urlZona, { headers: headersDb });
+    const agentsZona = await resZona.json();
+    
+    if (agentsZona && agentsZona.length > 0) {
+      return agentsZona[0];
+    }
+  }
+
+  // 2. Doble Salto (Rescate): Bolsa general (agentes sin prefijo)
+  const urlGeneral = `${env.SUPABASE_URL}/rest/v1/agents?${baseFilter}&or=(assigned_prefixes.is.null,assigned_prefixes.eq.)`;
+  const resGeneral = await fetch(urlGeneral, { headers: headersDb });
+  const agentsGeneral = await resGeneral.json();
+  
+  return (agentsGeneral && agentsGeneral.length > 0) ? agentsGeneral[0] : null;
+}
+
+// Ensamblador de Correos hacia el CRM del cliente con remitente dinámico
+async function sendToCRM(env, orgData, infoLead, estado, gestion, duracionStr) {
+  if (!orgData.crm_forwarding_email || !env.RESEND_API_KEY) return;
+
+  const htmlOriginal = infoLead.raw_payload?.html || infoLead.raw_payload?.text || "<p>Contenido original no disponible</p>";
+  const asuntoOriginal = infoLead.raw_payload?.subject || "Nuevo contacto inmobiliario";
+
+  const remitenteDinamico = orgData.inbound_email ? `NeoVox Relay <${orgData.inbound_email}>` : "NeoVox Relay <alertas@neovox.app>";
+
+  const cabecera = `
+    <div style="background-color: #f8f9fa; border-left: 4px solid #00A8E8; padding: 15px; margin-bottom: 20px; font-family: sans-serif;">
+      <h3 style="margin-top: 0; color: #333; font-size: 16px;">--- INFORME NEOVOX ---</h3>
+      <p style="margin: 5px 0; font-size: 14px;"><strong>Estado:</strong> ${estado}</p>
+      <p style="margin: 5px 0; font-size: 14px;"><strong>Gestión:</strong> ${gestion}</p>
+      <p style="margin: 5px 0; font-size: 14px;"><strong>Tiempo de llamada:</strong> ${duracionStr}</p>
+    </div>
+    <hr style="border: 1px solid #eee; margin-bottom: 20px;" />
+  `;
+
+  await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: remitenteDinamico,
+      to: orgData.crm_forwarding_email,
+      subject: `[NeoVox] ${asuntoOriginal}`,
+      html: cabecera + htmlOriginal
+    })
+  });
+}
+
 // Dispara la llamada en Twilio y actualiza la hora del comercial
 async function triggerTwilioCall(env, agent, telefonoCliente, telefonoAgencia, susurro, orgId, leadId) {
   const headersDb = getDbHeaders(env);
@@ -59,6 +115,7 @@ async function triggerTwilioCall(env, agent, telefonoCliente, telefonoAgencia, s
         From: telefonoAgencia, 
         Twiml: twiml,
         MachineDetection: 'Enable', 
+        Timeout: '20', 
         StatusCallback: statusCallbackUrl,
         StatusCallbackEvent: 'completed',
         StatusCallbackMethod: 'POST'
@@ -82,17 +139,17 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
     });
   }
 
-  const agentRes = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?org_id=eq.${orgId}&is_receiving_calls=eq.true&consecutive_misses=lt.3&id=neq.${currentAgentId}&order=last_assigned_at.asc&limit=1`, { headers: headersDb });
-  const nextAgents = await agentRes.json();
-  const nextAgent = nextAgents[0];
-
-  // Extraemos los datos del lead antes del if para tenerlos disponibles en la alerta
   let infoLead = null;
   if (leadId) {
-    const leadRes = await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}&select=parsed_data,ai_whisper`, { headers: headersDb });
+    const leadRes = await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}&select=parsed_data,ai_whisper,raw_payload`, { headers: headersDb });
     const leadData = await leadRes.json();
     infoLead = leadData[0];
   }
+
+  // Rescate del prefijo extraído por la IA
+  const leadPrefix = infoLead?.parsed_data?.prefijo_enrutamiento || null;
+
+  const nextAgent = await getNextAvailableAgent(env, orgId, currentAgentId, leadPrefix);
 
   if (nextAgent && infoLead) {
     const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=assigned_phone`, { headers: headersDb });
@@ -118,10 +175,14 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
       });
     }
   } else {
-    const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=contact_email,name`, { headers: headersDb });
+    const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=contact_email,name,crm_forwarding_email,inbound_email`, { headers: headersDb });
     const orgData = await orgRes.json();
-    const contactEmail = orgData[0]?.contact_email;
+    
+    if (infoLead && orgData[0]) {
+        await sendToCRM(env, orgData[0], infoLead, "🔴 No atendido (Se agotó la cadena de relevos)", "Pendiente de llamada manual", "0 segundos");
+    }
 
+    const contactEmail = orgData[0]?.contact_email;
     if (contactEmail && env.RESEND_API_KEY) {
       const nombreCli = infoLead?.parsed_data?.nombre || "Desconocido";
       const telCli = infoLead?.parsed_data?.telefono || "No disponible";
@@ -164,7 +225,6 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
 // ============================================================================
 
 export default {
-  // 1. MANEJADOR HTTP: Gestión de voz y estado de llamadas
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const headersDb = getDbHeaders(env);
@@ -187,7 +247,7 @@ export default {
 
         const xmlDial = `<?xml version="1.0" encoding="UTF-8"?>
           <Response>
-            <Dial callerId="${telefonoAgencia}">${telefonoCliente}</Dial>
+            <Dial callerId="${telefonoAgencia}" timeout="60">${telefonoCliente}</Dial>
           </Response>`;
         return new Response(xmlDial, { headers: { 'Content-Type': 'text/xml' } });
       }
@@ -227,6 +287,19 @@ export default {
 
       if (callStatus === 'no-answer' || callStatus === 'failed' || callStatus === 'busy' || answeredBy === 'machine_start') {
         ctx.waitUntil(executeFallback(env, orgId, agentId, leadId));
+      } else if (callStatus === 'completed' && answeredBy !== 'machine_start') {
+        ctx.waitUntil((async () => {
+          const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=crm_forwarding_email,inbound_email`, { headers: headersDb });
+          const orgData = await orgRes.json();
+          const leadRes = await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${leadId}&select=raw_payload`, { headers: headersDb });
+          const leadData = await leadRes.json();
+          const agentRes = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=full_name`, { headers: headersDb });
+          const agentData = await agentRes.json();
+          
+          if (orgData[0] && leadData[0]) {
+             await sendToCRM(env, orgData[0], leadData[0], "🟢 Conectado", agentData[0]?.full_name || "Comercial", `${callDuration || 0} segundos`);
+          }
+        })());
       }
 
       if (orgId && agentId) {
@@ -250,14 +323,15 @@ export default {
     return new Response('NeoVox Búnker Online', { status: 200 });
   },
 
-  // 2. MANEJADOR DE EMAIL: Procesador de leads entrantes
   async email(message, env, ctx) {
+    let orgDataRescate = null;
+    let safePayloadRescate = null;
+
     try {
       const email = await PostalMime.parse(message.raw, { attachmentEncoding: 'base64' });
       
-      // NUEVO: Cortafuegos anti-bucles SMTP
       const remitente = (email.from?.address || "").toLowerCase();
-      if (remitente === "alertas@neovox.app") {
+      if (remitente === "alertas@neovox.app" || remitente.endsWith("@neovox.app")) {
           console.log("Bloqueo de seguridad: Correo rebotado desde el propio sistema de alertas. Abortando lectura.");
           return;
       }
@@ -272,10 +346,12 @@ export default {
           html: email.html
       };
 
+      safePayloadRescate = safePayload;
+
       const headersDb = getDbHeaders(env);
 
       const targetEmail = (message.to || "").toLowerCase();
-      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${targetEmail}&select=id,business_hours,assigned_phone,ai_prompt_template,contact_email,name`, { headers: headersDb });
+      const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?inbound_email=eq.${targetEmail}&select=id,business_hours,assigned_phone,ai_prompt_template,contact_email,name,crm_forwarding_email,inbound_email`, { headers: headersDb });
       const orgData = await orgRes.json();
 
       if (!Array.isArray(orgData) || orgData.length === 0) {
@@ -283,6 +359,7 @@ export default {
           return;
       }
 
+      orgDataRescate = orgData[0];
       const orgId = orgData[0].id;
 
       const leadInsert = await fetch(`${env.SUPABASE_URL}/rest/v1/leads`, {
@@ -303,9 +380,12 @@ export default {
       const currentLeadId = insertedLeads[0]?.id;
       const reglaAgencia = orgData[0].ai_prompt_template || "Resume el contacto entrante indicando el nombre y el inmueble en máximo 15 palabras. Cero saludos y cero despedidas.";
 
+      // Petición a la IA modificada con el parámetro "prefijo_enrutamiento"
       const extractorPrompt = `Eres un procesador de datos backend. Analiza este correo inmobiliario y extrae la información del inquilino/comprador. Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta. Si un dato no aparece, pon null.
       {
         "origen": "idealista o fotocasa o pisos.com o tecnocasa o habitaclia o desconocido",
+        "es_publicidad": true o false (Pon true SOLAMENTE si es claramente un boletín, newsletter o aviso genérico de portal sin un cliente real detrás),
+        "prefijo_enrutamiento": "Busca un código corto que termine en guion (ej. Z1-, ALQ-) en la referencia del anuncio. Si no hay, pon null",
         "nombre": "nombre del cliente",
         "telefono": "teléfono con prefijo internacional, ej: +34600000000",
         "perfil_inquilino": {
@@ -341,7 +421,21 @@ export default {
         datosExtraidos = JSON.parse(aiResponse);
       } catch (e) {
         console.log("Error al leer el JSON de la IA:", aiResponse);
-        return;
+        throw new Error("Fallo en lectura de JSON de Groq");
+      }
+
+      if (datosExtraidos.es_publicidad === true) {
+          console.log("Detectada publicidad o newsletter. Descartando envío al CRM.");
+          await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
+              method: 'PATCH',
+              headers: headersDb,
+              body: JSON.stringify({ 
+                  portal_source: datosExtraidos.origen,
+                  parsed_data: datosExtraidos,
+                  status: "rejected_spam" 
+              })
+          });
+          return; 
       }
 
       if (!datosExtraidos.telefono) {
@@ -354,6 +448,8 @@ export default {
                   status: "manual_review_needed" 
               })
           });
+
+          await sendToCRM(env, orgData[0], { raw_payload: safePayload }, "🟡 Sin Teléfono (Revisión Manual)", "No procesable", "0 segundos");
 
           const contactEmail = orgData[0]?.contact_email;
           if (contactEmail && env.RESEND_API_KEY) {
@@ -387,16 +483,14 @@ export default {
 
       let agent = null;
       if (!isOutOfHours) {
-          const agentRes = await fetch(`${env.SUPABASE_URL}/rest/v1/agents?org_id=eq.${orgId}&is_receiving_calls=eq.true&consecutive_misses=lt.3&order=last_assigned_at.asc&limit=1`, { headers: headersDb });
-          const agents = await agentRes.json();
-          agent = agents[0];
+          const leadPrefix = datosExtraidos.prefijo_enrutamiento || null;
+          agent = await getNextAvailableAgent(env, orgId, null, leadPrefix);
       }
 
       let finalStatus = "connected";
       if (isOutOfHours) finalStatus = "pending_notification";
       else if (!agent) finalStatus = "unanswered";
 
-      // Lógica de corrección de canal
       const canalReal = (datosExtraidos.origen && datosExtraidos.origen !== 'desconocido') 
           ? 'portal_inmobiliario' 
           : 'correo_directo';
@@ -409,7 +503,6 @@ export default {
           status: finalStatus
       };
 
-      // Aquí cerramos la asignación en una única escritura
       if (agent) {
           updatePayload.assigned_agent_id = agent.id;
       }
@@ -424,7 +517,15 @@ export default {
           console.log("Error DB actualización completa:", await patchResFull.text());
       }
 
-      if (isOutOfHours || !agent) return;
+      if (isOutOfHours) {
+          await sendToCRM(env, orgData[0], { raw_payload: safePayload }, "🔵 Fuera de horario", "Pendiente de llamada manual", "0 segundos");
+          return;
+      }
+      
+      if (!agent) {
+          await executeFallback(env, orgId, null, currentLeadId);
+          return;
+      }
 
       await triggerTwilioCall(env, agent, datosExtraidos.telefono, telefonoAgencia, datosExtraidos.susurro_ia, orgId, currentLeadId);
 
@@ -438,10 +539,13 @@ export default {
 
     } catch (error) {
       console.log("Fallo crítico general:", error.message);
+      
+      if (orgDataRescate && orgDataRescate.crm_forwarding_email && safePayloadRescate) {
+         await sendToCRM(env, orgDataRescate, { raw_payload: safePayloadRescate }, "⚫ Fallo de Servidor", "Enviado en bruto por seguridad", "0 segundos");
+      }
     }
   },
 
-  // 3. MANEJADOR DE TAREAS: Disparador matutino de resúmenes
   async scheduled(event, env, ctx) {
     const { dayName, hourNum } = getMadridDateTime();
     const headersDb = getDbHeaders(env);
