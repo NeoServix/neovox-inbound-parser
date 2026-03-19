@@ -28,13 +28,40 @@ function getDbHeaders(env) {
   };
 }
 
+// Verificador criptográfico para la conexión segura con Stripe
+async function verifyStripeSignature(payload, signatureHeader, secret) {
+  if (!signatureHeader || !secret) return false;
+  
+  const parts = signatureHeader.split(',');
+  let timestamp, signature;
+  
+  for (const part of parts) {
+    if (part.startsWith('t=')) timestamp = part.substring(2);
+    if (part.startsWith('v1=')) signature = part.substring(3);
+  }
+  
+  if (!timestamp || !signature) return false;
+
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false, ['sign']
+  );
+
+  const signedPayload = `${timestamp}.${payload}`;
+  const signatureBytes = await crypto.subtle.sign('HMAC', key, enc.encode(signedPayload));
+  const signatureHex = Array.from(new Uint8Array(signatureBytes)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  return signatureHex === signature;
+}
+
 // Motor de búsqueda con Doble Salto (Zona -> General)
 async function getNextAvailableAgent(env, orgId, currentAgentId, leadPrefix) {
   const headersDb = getDbHeaders(env);
   const excludeFilter = currentAgentId ? `&id=neq.${currentAgentId}` : '';
   const baseFilter = `org_id=eq.${orgId}&is_receiving_calls=eq.true&consecutive_misses=lt.3${excludeFilter}&order=last_assigned_at.asc&limit=1`;
 
-  // 1. Primer Salto: Intento de enrutamiento por zona
   if (leadPrefix) {
     const urlZona = `${env.SUPABASE_URL}/rest/v1/agents?${baseFilter}&assigned_prefixes=ilike.*${leadPrefix}*`;
     const resZona = await fetch(urlZona, { headers: headersDb });
@@ -45,7 +72,6 @@ async function getNextAvailableAgent(env, orgId, currentAgentId, leadPrefix) {
     }
   }
 
-  // 2. Doble Salto (Rescate): Bolsa general (agentes sin prefijo)
   const urlGeneral = `${env.SUPABASE_URL}/rest/v1/agents?${baseFilter}&or=(assigned_prefixes.is.null,assigned_prefixes.eq.)`;
   const resGeneral = await fetch(urlGeneral, { headers: headersDb });
   const agentsGeneral = await resGeneral.json();
@@ -123,7 +149,7 @@ async function triggerTwilioCall(env, agent, telefonoCliente, telefonoAgencia, s
   });
 }
 
-// Lógica central del relevo: suma el fallo y busca al siguiente en la lista
+// Lógica central del relevo
 async function executeFallback(env, orgId, currentAgentId, leadId) {
   const headersDb = getDbHeaders(env);
 
@@ -146,9 +172,7 @@ async function executeFallback(env, orgId, currentAgentId, leadId) {
     infoLead = leadData[0];
   }
 
-  // Rescate del prefijo extraído por la IA
   const leadPrefix = infoLead?.parsed_data?.prefijo_enrutamiento || null;
-
   const nextAgent = await getNextAvailableAgent(env, orgId, currentAgentId, leadPrefix);
 
   if (nextAgent && infoLead) {
@@ -228,6 +252,66 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const headersDb = getDbHeaders(env);
+
+    // RUTAS DE PAGO STRIPE (Enrutador de comandos)
+    if (request.method === 'POST' && url.pathname === '/webhook') {
+      const signature = request.headers.get('Stripe-Signature');
+      const rawBody = await request.text(); 
+
+      try {
+        const isValid = await verifyStripeSignature(rawBody, signature, env.STRIPE_WEBHOOK_SECRET);
+        
+        if (!isValid) {
+          console.log("Bloqueo de seguridad: Firma de Stripe inválida.");
+          return new Response('Firma inválida', { status: 400 });
+        }
+
+        const payload = JSON.parse(rawBody);
+        
+        // Alta de producto o plan
+        if (payload.type === 'checkout.session.completed') {
+          const session = payload.data.object;
+          const rawRef = session.client_reference_id; // Ej: "UUID|extra" o "UUID|pro"
+
+          if (rawRef && rawRef.includes('|')) {
+            const [orgId, accion] = rawRef.split('|');
+
+            if (accion === 'extra') {
+              const orgRes = await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}&select=extra_agents_quota`, { headers: headersDb });
+              const orgData = await orgRes.json();
+
+              if (orgData && orgData.length > 0) {
+                const currentQuota = orgData[0].extra_agents_quota || 0;
+                await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}`, {
+                  method: 'PATCH',
+                  headers: headersDb,
+                  body: JSON.stringify({ extra_agents_quota: currentQuota + 1 })
+                });
+                console.log(`[Stripe] Cuota ampliada para agencia: ${orgId}`);
+              }
+            } else if (accion === 'essential' || accion === 'pro' || accion === 'elite') {
+              await fetch(`${env.SUPABASE_URL}/rest/v1/organizations?id=eq.${orgId}`, {
+                method: 'PATCH',
+                headers: headersDb,
+                body: JSON.stringify({ plan_tier: accion })
+              });
+              console.log(`[Stripe] Plan actualizado a ${accion} para agencia: ${orgId}`);
+            }
+          }
+        }
+
+        // Suscripción cancelada
+        if (payload.type === 'customer.subscription.deleted') {
+          const subscription = payload.data.object;
+          console.log(`[Stripe] Suscripción cancelada detectada: ${subscription.id}`);
+        }
+
+        return new Response(JSON.stringify({ received: true }), { status: 200 });
+      } catch (err) {
+        console.log("Fallo procesando Webhook Stripe:", err.message);
+        return new Response(`Error interno`, { status: 500 });
+      }
+    }
 
     if (request.method === 'POST' && url.pathname === '/gather') {
       const formData = await request.formData();
@@ -332,7 +416,6 @@ export default {
       
       const remitente = (email.from?.address || "").toLowerCase();
       if (remitente === "alertas@neovox.app" || remitente.endsWith("@neovox.app")) {
-          console.log("Bloqueo de seguridad: Correo rebotado desde el propio sistema de alertas. Abortando lectura.");
           return;
       }
 
@@ -355,7 +438,6 @@ export default {
       const orgData = await orgRes.json();
 
       if (!Array.isArray(orgData) || orgData.length === 0) {
-          console.log("Rechazado: Agencia no encontrada o error DB para el correo", targetEmail);
           return;
       }
 
@@ -380,7 +462,6 @@ export default {
       const currentLeadId = insertedLeads[0]?.id;
       const reglaAgencia = orgData[0].ai_prompt_template || "Resume el contacto entrante indicando el nombre y el inmueble en máximo 15 palabras. Cero saludos y cero despedidas.";
 
-      // Petición a la IA modificada con el parámetro "prefijo_enrutamiento"
       const extractorPrompt = `Eres un procesador de datos backend. Analiza este correo inmobiliario y extrae la información del inquilino/comprador. Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta. Si un dato no aparece, pon null.
       {
         "origen": "idealista o fotocasa o pisos.com o tecnocasa o habitaclia o desconocido",
@@ -420,12 +501,10 @@ export default {
       try {
         datosExtraidos = JSON.parse(aiResponse);
       } catch (e) {
-        console.log("Error al leer el JSON de la IA:", aiResponse);
         throw new Error("Fallo en lectura de JSON de Groq");
       }
 
       if (datosExtraidos.es_publicidad === true) {
-          console.log("Detectada publicidad o newsletter. Descartando envío al CRM.");
           await fetch(`${env.SUPABASE_URL}/rest/v1/leads?id=eq.${currentLeadId}`, {
               method: 'PATCH',
               headers: headersDb,
@@ -538,8 +617,6 @@ export default {
       }
 
     } catch (error) {
-      console.log("Fallo crítico general:", error.message);
-      
       if (orgDataRescate && orgDataRescate.crm_forwarding_email && safePayloadRescate) {
          await sendToCRM(env, orgDataRescate, { raw_payload: safePayloadRescate }, "⚫ Fallo de Servidor", "Enviado en bruto por seguridad", "0 segundos");
       }
